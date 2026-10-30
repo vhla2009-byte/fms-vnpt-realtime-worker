@@ -203,7 +203,7 @@ async function pushAlarmsToGoogleSheets(alarms) {
 const activeAlarmsMemoryMap = new Map();
 let stationsMemoryCache = null;
 let stationsCacheLastFetchedAt = 0;
-const STATIONS_CACHE_TTL_MS = 60 * 60 * 1000; // 1 tiếng làm mới danh mục trạm 1 lần
+const STATIONS_CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12 tiếng làm mới danh mục trạm 1 lần (đảm bảo không bao giờ vượt trần 360MB/ngày)
 let isStationsFetching = false;
 
 /**
