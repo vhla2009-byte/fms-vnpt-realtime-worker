@@ -199,28 +199,97 @@ async function pushAlarmsToGoogleSheets(alarms) {
   }
 }
 
+// ==================== BỘ NHỚ ĐỆM RAM (IN-MEMORY CACHE) TIẾT KIỆM 99.9% BĂNG THÔNG ====================
+const activeAlarmsMemoryMap = new Map();
+let stationsMemoryCache = null;
+let stationsCacheLastFetchedAt = 0;
+const STATIONS_CACHE_TTL_MS = 60 * 60 * 1000; // 1 tiếng làm mới danh mục trạm 1 lần
+let isStationsFetching = false;
+
+/**
+ * Lấy dữ liệu toàn bộ trạm từ bộ nhớ RAM (Chỉ tải Firebase 1 lần khi khởi động hoặc sau mỗi 1 tiếng)
+ */
+async function getStationsFromMemoryOrDb(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && stationsMemoryCache && (now - stationsCacheLastFetchedAt < STATIONS_CACHE_TTL_MS)) {
+    return stationsMemoryCache;
+  }
+  if (isStationsFetching && stationsMemoryCache) {
+    return stationsMemoryCache;
+  }
+  isStationsFetching = true;
+  try {
+    console.log("[CACHE RAM] 📥 Đang tải stations.json từ Firebase vào bộ nhớ RAM...");
+    const res = await fetch(`${FIREBASE_DB_URL}/stations.json`);
+    if (res.ok) {
+      stationsMemoryCache = await res.json();
+      stationsCacheLastFetchedAt = Date.now();
+      const regCount = stationsMemoryCache ? Object.keys(stationsMemoryCache).length : 0;
+      console.log(`[CACHE RAM] ✅ Đã lưu stations.json vào RAM thành công! (${regCount} khu vực)`);
+    }
+  } catch (err) {
+    console.warn("[CACHE RAM] ⚠️ Lỗi tải stations.json:", err.message);
+  } finally {
+    isStationsFetching = false;
+  }
+  return stationsMemoryCache;
+}
+
+/**
+ * Lấy danh sách sự cố FMS đang Active trực tiếp từ RAM (0 MB tải Firebase!)
+ */
+async function getActiveAlarmsList() {
+  if (activeAlarmsMemoryMap.size > 0) {
+    return Array.from(activeAlarmsMemoryMap.values());
+  }
+  try {
+    console.log("[CACHE RAM] 📥 Nạp danh sách sự cố FMS từ Firebase vào RAM...");
+    const res = await fetch(`${FIREBASE_DB_URL}/fms_alarms/items.json`);
+    if (res.ok) {
+      const itemsMap = await res.json();
+      if (itemsMap && typeof itemsMap === "object") {
+        activeAlarmsMemoryMap.clear();
+        for (const [k, v] of Object.entries(itemsMap)) {
+          if (v && String(v.CLEAR_STATUS || "0") !== "1" && v.CLR_TEXT !== "CLR") {
+            activeAlarmsMemoryMap.set(k, v);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[CACHE RAM] ⚠️ Lỗi nạp fms_alarms vào RAM:", err.message);
+  }
+  return Array.from(activeAlarmsMemoryMap.values());
+}
+
 async function pushAlarmsToFirebase(alarms, isFullSnapshot = false) {
   try {
     const list = Array.isArray(alarms) ? alarms : [alarms];
     if (isFullSnapshot) {
+      activeAlarmsMemoryMap.clear();
       const items = {};
       list.forEach(item => {
         if (item) {
           const key = getUnifiedAlarmKey(item) || String(item.GLOBAL_ID);
-          items[key] = {
+          const clr = getClrStatus(item);
+          const enriched = {
             ...item,
             UNIFIED_KEY: key,
-            CLR_TEXT: getClrStatus(item)
+            CLR_TEXT: clr
           };
+          items[key] = enriched;
+          if (String(item.CLEAR_STATUS || "0") !== "1" && clr !== "CLR") {
+            activeAlarmsMemoryMap.set(key, enriched);
+          }
         }
       });
-      activeAlarmCount = list.length;
+      activeAlarmCount = activeAlarmsMemoryMap.size || list.length;
       await fetch(`${FIREBASE_DB_URL}/fms_alarms.json`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           updated_at: new Date().toISOString(),
-          total_active: list.length,
+          total_active: activeAlarmCount,
           items
         })
       });
@@ -234,23 +303,29 @@ async function pushAlarmsToFirebase(alarms, isFullSnapshot = false) {
         const isClr = getClrStatus(item) === "CLR";
 
         if (isClr) {
+          if (keyActive) activeAlarmsMemoryMap.delete(keyActive);
+          if (keyClr) activeAlarmsMemoryMap.delete(keyClr);
+          if (gid) activeAlarmsMemoryMap.delete(gid);
           if (keyActive) await fetch(`${FIREBASE_DB_URL}/fms_alarms/items/${encodeURIComponent(keyActive)}.json`, { method: "DELETE" }).catch(() => {});
           if (gid) await fetch(`${FIREBASE_DB_URL}/fms_alarms/items/${gid}.json`, { method: "DELETE" }).catch(() => {});
         } else {
           const writeKey = keyActive || gid;
           if (writeKey) {
+            const enriched = {
+              ...item,
+              UNIFIED_KEY: writeKey,
+              CLR_TEXT: "NCLR"
+            };
+            activeAlarmsMemoryMap.set(writeKey, enriched);
             await fetch(`${FIREBASE_DB_URL}/fms_alarms/items/${encodeURIComponent(writeKey)}.json`, {
               method: "PUT",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                ...item,
-                UNIFIED_KEY: writeKey,
-                CLR_TEXT: "NCLR"
-              })
+              body: JSON.stringify(enriched)
             }).catch(() => {});
           }
         }
       }
+      activeAlarmCount = activeAlarmsMemoryMap.size;
       // Cập nhật mốc thời gian sự cố realtime mới nhất lên Firebase
       const nowIso = new Date().toISOString();
       const nowVn = new Date().toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" });
@@ -259,13 +334,14 @@ async function pushAlarmsToFirebase(alarms, isFullSnapshot = false) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           updated_at: nowIso,
-          updated_at_vn: nowVn
+          updated_at_vn: nowVn,
+          total_active: activeAlarmCount
         })
       }).catch(() => {});
     }
 
-    // Tự động kích hoạt đồng bộ chuẩn hóa trạng thái trạm theo FMS
-    scheduleStationStatusSync(2000);
+    // Tự động kích hoạt đồng bộ chuẩn hóa trạng thái trạm theo FMS (gom cụm sau 3s)
+    scheduleStationStatusSync(3000);
   } catch (err) {
     console.error("[FIREBASE] Lỗi cập nhật sự cố:", err.message);
   }
@@ -320,7 +396,7 @@ function computeStationStatusFromAlarms(stationAlarms) {
 let stationSyncTimer = null;
 let isSyncingStations = false;
 
-function scheduleStationStatusSync(delayMs = 2000) {
+function scheduleStationStatusSync(delayMs = 3000) {
   if (stationSyncTimer) clearTimeout(stationSyncTimer);
   stationSyncTimer = setTimeout(() => {
     syncStationStatusesFromFmsAlarms().catch((e) => {
@@ -329,22 +405,24 @@ function scheduleStationStatusSync(delayMs = 2000) {
   }, delayMs);
 }
 
+/**
+ * Đối soát và đồng bộ trạng thái trạm: SỬ DỤNG 100% BỘ NHỚ RAM ĐỆM
+ * Không tải lại toàn bộ 25MB stations.json mỗi lần có sự cố -> Giảm 99.9% băng thông tải!
+ */
 async function syncStationStatusesFromFmsAlarms() {
   if (isSyncingStations) return;
   isSyncingStations = true;
   try {
-    const [fmsRes, stRes] = await Promise.all([
-      fetch(`${FIREBASE_DB_URL}/fms_alarms.json`),
-      fetch(`${FIREBASE_DB_URL}/stations.json`)
-    ]);
-    const fmsData = await fmsRes.json();
-    const stationsData = await stRes.json();
+    // 1. Lấy dữ liệu trạm từ RAM (nếu chưa có mới nạp 1 lần)
+    const stationsData = await getStationsFromMemoryOrDb();
     if (!stationsData) return;
 
-    const allAlarms = Array.isArray(fmsData?.items) ? fmsData.items : Object.values(fmsData?.items || {});
-    const activeAlarms = allAlarms.filter(a => String(a.CLEAR_STATUS || "0") !== "1");
+    // 2. Lấy sự cố Active trực tiếp từ RAM (0 MB tải Firebase!)
+    const activeAlarms = await getActiveAlarmsList();
 
     const regions = ["THU", "VHU", "TTH", "THO", "MHO", "KTU"];
+    let updatedCount = 0;
+
     for (const reg of regions) {
       const rawList = stationsData[reg];
       if (!rawList) continue;
@@ -360,9 +438,13 @@ async function syncStationStatusesFromFmsAlarms() {
         const currentStatus = (st.STATUS || "").trim();
 
         if (currentStatus !== newStatus.trim()) {
+          updatedCount++;
           console.log(`[STATION SYNC] Cập nhật ${reg} - ${csht}: ${currentStatus.replace(/\n/g, " | ")} -> ${newStatus.replace(/\n/g, " | ")}`);
 
-          // 1. Cập nhật Firebase RTDB
+          // Cập nhật ngay vào RAM cache để các vòng lặp kế tiếp không gửi lệnh PATCH trùng lặp
+          st.STATUS = newStatus;
+
+          // 1. Cập nhật DUY NHẤT node trạm này lên Firebase RTDB (chỉ vài chục bytes)
           await fetch(`${FIREBASE_DB_URL}/stations/${reg}/${idxKey}.json`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
@@ -383,6 +465,9 @@ async function syncStationStatusesFromFmsAlarms() {
           }
         }
       }
+    }
+    if (updatedCount > 0) {
+      console.log(`[STATION SYNC] ✅ Đã cập nhật xong ${updatedCount} trạm biến động lên Firebase.`);
     }
   } catch (err) {
     console.error("[STATION SYNC] Lỗi trong quá trình đối soát trạm:", err.message);
@@ -714,7 +799,7 @@ async function syncFullSnapshotFromRestApi() {
       // 1. Đẩy qua Firebase RTDB
       await pushAlarmsToFirebase(alarms, true);
       // 2. Đẩy qua Google Sheets
-      await syncFirebaseSnapshotToGoogleSheets();
+      await syncFirebaseSnapshotToGoogleSheets(alarms);
       console.log(`[SNAPSHOT DUAL] Đã đẩy thành công ${alarms.length} sự cố hợp nhất qua Firebase đến Google Sheets.`);
     } else {
       console.log(`[SNAPSHOT DUAL] Cả 2 hướng REST API trả về 0 bản ghi cho [${currentAccount}]. Tự động đồng bộ Snapshot từ Firebase sang Google Sheets...`);
@@ -728,14 +813,21 @@ async function syncFullSnapshotFromRestApi() {
 /**
  * Đồng bộ toàn bộ sự cố đang Active từ Firebase RTDB sang Google Sheets (chia nhỏ từng batch 40 items)
  */
-async function syncFirebaseSnapshotToGoogleSheets() {
+async function syncFirebaseSnapshotToGoogleSheets(alarmsList = null) {
   if (!GOOGLE_SHEET_WEBHOOK_URL) return;
   try {
-    const res = await fetch(`${FIREBASE_DB_URL}/fms_alarms/items.json`);
-    if (!res.ok) return;
-    const itemsMap = await res.json();
-    if (!itemsMap) return;
-    let allItems = Object.values(itemsMap).filter(isTnhLanAlarm);
+    let allItems = [];
+    if (alarmsList && Array.isArray(alarmsList) && alarmsList.length > 0) {
+      allItems = alarmsList.filter(isTnhLanAlarm);
+    } else if (activeAlarmsMemoryMap.size > 0) {
+      allItems = Array.from(activeAlarmsMemoryMap.values()).filter(isTnhLanAlarm);
+    } else {
+      const res = await fetch(`${FIREBASE_DB_URL}/fms_alarms/items.json`);
+      if (!res.ok) return;
+      const itemsMap = await res.json();
+      if (!itemsMap) return;
+      allItems = Object.values(itemsMap).filter(isTnhLanAlarm);
+    }
     if (allItems.length === 0) {
       console.log("[FIREBASE -> SHEETS] Không có sự cố nào để đồng bộ.");
       return;
@@ -1327,10 +1419,14 @@ const server = http.createServer(async (req, res) => {
  * Lắng nghe lệnh OTP từ Web App & MacroDroid qua Firebase RTDB (Bỏ qua hoàn toàn giới hạn quota của Google Apps Script)
  */
 async function pollFirebaseOtpCommands() {
+  let nextInterval = 4000; // Mặc định 4s khi rảnh (tiết kiệm 75% số lượt đọc)
   try {
     const res = await fetch(`${FIREBASE_DB_URL}/_fms_config/cas_command.json`);
     if (res.ok) {
       const cmd = await res.json();
+      if (cmd && (!cmd.processed || cmd.action === "request_otp" || (cmd.otp && cmd.action !== "idle"))) {
+        nextInterval = 1500; // Kiểm tra nhanh hơn khi có lệnh
+      }
       if (cmd && !cmd.processed) {
         await fetch(`${FIREBASE_DB_URL}/_fms_config/cas_command.json`, {
           method: "PATCH",
@@ -1434,7 +1530,7 @@ async function pollFirebaseOtpCommands() {
       }
     }
   } catch (e) {}
-  setTimeout(pollFirebaseOtpCommands, 1000);
+  setTimeout(pollFirebaseOtpCommands, nextInterval);
 }
 
 /**
@@ -1442,6 +1538,11 @@ async function pollFirebaseOtpCommands() {
  */
 (async () => {
   await loadConfigFromFirebase();
+  // Nạp sẵn toàn bộ danh mục trạm và sự cố FMS vào RAM khi khởi động
+  await Promise.all([
+    getStationsFromMemoryOrDb().catch(() => {}),
+    getActiveAlarmsList().catch(() => {})
+  ]);
   server.listen(PORT, () => {
     console.log(`🚀 FMS Cloud Worker đang lắng nghe tại cổng ${PORT}`);
   });
@@ -1474,7 +1575,7 @@ async function pollFirebaseOtpCommands() {
     }
   }, 10 * 60 * 1000);
 
-  // TỰ ĐỘNG THEO DÕI NÚT CHỌN TRÊN WEB APP (Mỗi 3 giây kiểm tra Firebase)
+  // TỰ ĐỘNG THEO DÕI NÚT CHỌN TRÊN WEB APP (Mỗi 10 giây kiểm tra Firebase, giảm 70% tải)
   setInterval(async () => {
     try {
       const res = await fetch(`${FIREBASE_DB_URL}/_fms_config.json`);
@@ -1490,12 +1591,12 @@ async function pollFirebaseOtpCommands() {
         }
       }
     } catch {}
-  }, 3000);
+  }, 10000);
 
-  // ĐỊNH KỲ ĐỒNG BỘ CHUẨN HÓA TRẠNG THÁI TRẠM THEO FMS (Mỗi 30 giây)
+  // ĐỊNH KỲ ĐỒNG BỘ CHUẨN HÓA TRẠNG THÁI TRẠM THEO FMS (Mỗi 60 giây đối soát RAM)
   setInterval(() => {
-    scheduleStationStatusSync(100);
-  }, 30 * 1000);
+    scheduleStationStatusSync(500);
+  }, 60 * 1000);
 
   // Đặt lịch tự động gọi mã OTP CAS VNPT cho phiên mới vào 06:10 sáng hàng ngày (GMT+7)
   let lastDailyOtpDate = null;
