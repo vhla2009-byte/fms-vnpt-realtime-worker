@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: fms-vnpt-realtime-worker
+    runtime: docker
+    plan: free
+    region: singapore
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: FMS_PROVINCE
+        value: "1057,1006"
+      - key: FIREBASE_DB_URL
+        value: "https://appqlnt-ee302-default-rtdb.asia-southeast1.firebasedatabase.app"
+      - key: GOOGLE_SHEET_WEBHOOK_URL
+        value: "https://script.google.com/macros/s/AKfycbxmBxO3sPvXlkxY9EYNdfmj5Lj-_biDQSo1GRmsuy6tP8MFZYByY4SWjS1MkfEz1frKHw/exec"

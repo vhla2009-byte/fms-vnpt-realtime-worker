@@ -1,0 +1,16 @@
+{
+  "name": "fms-vnpt-cloud-worker",
+  "version": "1.0.0",
+  "description": "24/7 Cloud Worker connecting to FMS VNPT SignalR WebSocket & pushing realtime alarms to Google Sheets, Firebase RTDB, and Telegram",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@microsoft/signalr": "^8.0.7",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
