@@ -1559,6 +1559,15 @@ async function pollFirebaseOtpCommands() {
 
   // Chu kỳ 15 phút gọi pingback giữ phiên sống & kiểm tra Cookie
   setInterval(pingbackAndKeepAlive, 15 * 60 * 1000);
+  // TỰ ĐỘNG GÕ CỬA TÊN MIỀN RENDER ĐỂ GIỮ SERVER THỨC 24/7 (Chống Render Free Spin-down)
+  const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || "https://fms-vnpt-realtime-worker.onrender.com";
+  setInterval(() => {
+    fetch(RENDER_EXTERNAL_URL)
+      .then(r => r.json())
+      .then(d => console.log(`[SELF KEEP-ALIVE] 💓 Đã tự gõ cửa Render thành công (Active: ${d.active_alarms})`))
+      .catch(() => {});
+  }, 10 * 60 * 1000);
+
 
   // Chu kỳ đồng bộ định kỳ theo từng chế độ:
   // - Giải pháp 1 (REST): Quét toàn diện mỗi 60 giây
