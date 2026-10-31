@@ -739,9 +739,10 @@ async function pingbackAndKeepAlive() {
   if (!currentCookie) return;
   try {
     // 1. Kiểm tra Cookie HTTP thực tế qua endpoint pingback của FMS (không dựa dẫm vào trạng thái WebSocket)
+    const pingCookie = (currentSyncMode === "SIGNALR_WEBSOCKET") ? (wsCookie || currentCookie) : (restCookie || currentCookie);
     const pingRes = await fetch(`${FMS_BASE_URL}/new/pingback?lnk=${encodeURIComponent(FMS_BASE_URL + "/new/canhbao/radio3")}`, {
       headers: {
-        "Cookie": currentCookie,
+        "Cookie": pingCookie,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0.0.0 Safari/537.36",
         "X-Requested-With": "XMLHttpRequest"
       },
@@ -1199,8 +1200,17 @@ async function pollTelegramCommands() {
 let pendingCasSession = null;
 
 function extractCookiesFromHeaders(res, cookieJar) {
-  const raw = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
-  for (const c of raw) {
+  let raw = [];
+  if (typeof res.headers.getSetCookie === 'function') {
+    raw = res.headers.getSetCookie();
+  }
+  if (!raw || raw.length === 0) {
+    const single = res.headers.get('set-cookie');
+    if (single) {
+      raw = single.split(/,(?=\s*[^;]+=[^;]+)/g);
+    }
+  }
+  for (const c of raw || []) {
     const parts = c.split(';')[0].split('=');
     if (parts.length >= 2) {
       cookieJar[parts[0].trim()] = parts.slice(1).join('=').trim();
@@ -1235,8 +1245,11 @@ async function requestCasOtp(username = "ytv.lan", password = "P#r9zhk4") {
   const fmsCookies = {};
   const casCookies = {};
 
-  // Thử lần lượt các route chuyển hướng tới CAS VNPT: /login (siêu ổn định), /new/login, /new/canhbao/radio3
-  const candidateRoutes = ["/login", "/new/login", "/new/canhbao/radio3"];
+  // BẮT BUỘC: ytv.lan (WebSocket) phải bắt đầu từ /new/canhbao/radio3 hoặc /new/login
+  // để CAS VNPT chuyển hướng về /new/signin-cas -> Sản sinh đúng Cookie .AspNetCore.Cookies.fms_radio!
+  const candidateRoutes = (username === "huyhd.lan")
+    ? ["/login", "/new/canhbao/radio3", "/new/login"]
+    : ["/new/canhbao/radio3", "/new/login", "/login"];
   let casLoginUrl = null;
 
   for (const route of candidateRoutes) {
