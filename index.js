@@ -101,13 +101,92 @@ let lastAutoOtpRequestTime = 0;
 /**
  * Chuẩn hóa chuỗi Cookie FMS
  */
+/**
+ * TỰ ĐỘNG BÓC TÁCH VÀ NHẬN DIỆN COOKIE ĐÚNG LUỒNG:
+ * - Luồng 1 (REST / Hướng cũ / huyhd.lan): Bắt buộc .AspNetCore.Cookies (và SESSIONID)
+ * - Luồng 2 (SignalR WS / Hướng mới / ytv.lan): Bắt buộc .AspNetCore.Cookies.fms_radio (và SESSIONID)
+ */
+function parseAndRouteFmsCookies(rawInput) {
+  if (!rawInput) return { restCookie: "", wsCookie: "", fullCookie: "", hasRestCas: false, hasWsRadio: false, detectedStreams: [] };
+  let raw = String(rawInput).trim();
+  const detectedStreams = [];
+
+  const map = new Map();
+  if (!raw.includes("=")) {
+    map.set(".AspNetCore.Cookies.fms_radio", raw);
+    map.set(".AspNetCore.Cookies", raw);
+    detectedStreams.push("RAW_HASH");
+  } else {
+    const pairs = raw.split(";");
+    for (const p of pairs) {
+      const idx = p.indexOf("=");
+      if (idx !== -1) {
+        const k = p.substring(0, idx).trim();
+        const v = p.substring(idx + 1).trim();
+        if (k && v) {
+          map.set(k, v);
+        }
+      }
+    }
+  }
+
+  const sessionId = map.get("SESSIONID") || "";
+  const fmsRadioVal = map.get(".AspNetCore.Cookies.fms_radio") || "";
+  let restCasVal = map.get(".AspNetCore.Cookies") || "";
+  if (!restCasVal) {
+    for (const [k, v] of map.entries()) {
+      if (k.toLowerCase().includes("aspnetcore.cookies") && !k.toLowerCase().includes("fms_radio")) {
+        restCasVal = v;
+        break;
+      }
+    }
+  }
+
+  // 1. Luồng 2 (SignalR WebSocket & Vô tuyến mới): Bắt buộc .AspNetCore.Cookies.fms_radio
+  let wsCookie = "";
+  if (fmsRadioVal) {
+    detectedStreams.push("Luồng 2 (SignalR WS - .fms_radio)");
+    const parts = [];
+    if (sessionId) parts.push(`SESSIONID=${sessionId}`);
+    if (restCasVal) parts.push(`.AspNetCore.Cookies=${restCasVal}`);
+    parts.push(`.AspNetCore.Cookies.fms_radio=${fmsRadioVal}`);
+    wsCookie = parts.join("; ");
+  }
+
+  // 2. Luồng 1 (Cloud REST & Vô tuyến cũ): Bắt buộc .AspNetCore.Cookies
+  let restCookie = "";
+  if (restCasVal) {
+    detectedStreams.push("Luồng 1 (Cloud REST - .AspNetCore.Cookies)");
+    const parts = [];
+    if (sessionId) parts.push(`SESSIONID=${sessionId}`);
+    parts.push(`.AspNetCore.Cookies=${restCasVal}`);
+    if (fmsRadioVal) parts.push(`.AspNetCore.Cookies.fms_radio=${fmsRadioVal}`);
+    restCookie = parts.join("; ");
+  }
+
+  if (!wsCookie && restCookie) wsCookie = restCookie;
+  if (!restCookie && wsCookie) restCookie = wsCookie;
+
+  const allParts = [];
+  for (const [k, v] of map.entries()) {
+    allParts.push(`${k}=${v}`);
+  }
+  const fullCookie = allParts.join("; ") || wsCookie || restCookie;
+
+  return {
+    restCookie,
+    wsCookie,
+    fullCookie,
+    hasRestCas: Boolean(restCasVal),
+    hasWsRadio: Boolean(fmsRadioVal),
+    detectedStreams
+  };
+}
+
 function normalizeCookie(raw) {
   if (!raw) return "";
-  let clean = String(raw).trim();
-  if (!clean.includes("=")) {
-    clean = `.AspNetCore.Cookies.fms_radio=${clean}`;
-  }
-  return clean;
+  const routed = parseAndRouteFmsCookies(raw);
+  return routed.wsCookie || routed.fullCookie;
 }
 
 /**
@@ -123,9 +202,16 @@ async function loadConfigFromFirebase() {
       const newMode = data.sync_mode || "SIGNALR_WEBSOCKET";
       const oldMode = currentSyncMode;
 
-      restCookie = normalizeCookie(data?.auth_rest?.cookie || (newMode === "CLOUD_REST" ? data?.auth?.cookie : ""));
+      const rawRest = data?.auth_rest?.cookie || (newMode === "CLOUD_REST" ? data?.auth?.cookie : "");
+      const rawWs = data?.auth_ws?.cookie || (newMode === "SIGNALR_WEBSOCKET" ? data?.auth?.cookie : "");
+
+      const routedRest = parseAndRouteFmsCookies(rawRest);
+      const routedWs = parseAndRouteFmsCookies(rawWs);
+
+      restCookie = routedRest.restCookie || routedRest.fullCookie;
       restAccount = data?.auth_rest?.user || "huyhd.lan";
-      wsCookie = normalizeCookie(data?.auth_ws?.cookie || (newMode === "SIGNALR_WEBSOCKET" ? data?.auth?.cookie : ""));
+
+      wsCookie = routedWs.wsCookie || routedWs.fullCookie;
       wsAccount = data?.auth_ws?.user || "ytv.lan";
 
       currentSyncMode = newMode;
@@ -736,17 +822,24 @@ async function fetchDualSourceAlarms(activeCookie) {
   let isSessionValidOld = true;
   let isSessionValidNew = true;
 
+  // TỰ ĐỘNG GÁN ĐÚNG LUỒNG COOKIE CHO 2 HƯỚNG:
+  // - Hướng 1 (/api/alarm/find): Bắt buộc .AspNetCore.Cookies
+  // - Hướng 2 (/new/api/alarm/find): Bắt buộc .AspNetCore.Cookies.fms_radio
+  const routedActive = parseAndRouteFmsCookies(activeCookie);
+  const cookieForOldRoute = restCookie || routedActive.restCookie || activeCookie;
+  const cookieForNewRoute = wsCookie || routedActive.wsCookie || activeCookie;
+
   const [resOld, resNew] = await Promise.allSettled([
-    // Hướng 1: Tab Vô tuyến cũ (/api/alarm/find) -> LÀM GỐC
+    // Hướng 1: Tab Vô tuyến cũ (/api/alarm/find) -> Gán đúng .AspNetCore.Cookies
     fetch(`${FMS_BASE_URL}/api/alarm/find?${qsOld.toString()}`, {
       method: "GET",
-      headers: { ...headersCommon, "Referer": `${FMS_BASE_URL}/canhbao/radio3` },
+      headers: { ...headersCommon, "Cookie": cookieForOldRoute, "Referer": `${FMS_BASE_URL}/canhbao/radio3` },
       redirect: "manual"
     }),
-    // Hướng 2: Tab Vô tuyến mới (/new/api/alarm/find)
+    // Hướng 2: Tab Vô tuyến mới (/new/api/alarm/find) -> Gán đúng .AspNetCore.Cookies.fms_radio
     fetch(`${FMS_BASE_URL}/new/api/alarm/find?${qsNew.toString()}`, {
       method: "GET",
-      headers: { ...headersCommon, "Referer": `${FMS_BASE_URL}/new/canhbao/radio3` },
+      headers: { ...headersCommon, "Cookie": cookieForNewRoute, "Referer": `${FMS_BASE_URL}/new/canhbao/radio3` },
       redirect: "manual"
     })
   ]);
@@ -1367,15 +1460,16 @@ async function verifyCasOtp(otpCode) {
     }
   }
 
-  if (finalCookie) {
-    console.log(`🎉 [CAS] XÁC THỰC OTP TOÀN TRÌNH THÀNH CÔNG! ĐÃ CÓ COOKIE MỚI: ${finalCookie.substring(0, 45)}...`);
-    await saveCookieEverywhere(finalCookie);
+  const allHarvestedCookies = cookieJarToString(pendingCasSession.fmsCookies) || finalCookie;
+  if (allHarvestedCookies) {
+    console.log(`🎉 [CAS] XÁC THỰC OTP TOÀN TRÌNH THÀNH CÔNG! ĐANG TỰ ĐỘNG PHÂN LUỒNG COOKIE CHO CẢ 2 GIẢI PHÁP...`);
+    await saveCookieEverywhere(allHarvestedCookies, pendingCasSession.username || "ytv.lan");
     await startSignalRConnection();
     pendingCasSession = null;
     try {
       await fetch(`${FIREBASE_DB_URL}/_fms_config/pending_cas_session.json`, { method: "DELETE" });
     } catch (e) {}
-    return { status: "success", cookie: finalCookie, message: "Đã xác thực OTP và cập nhật Cookie mới thành công!" };
+    return { status: "success", cookie: allHarvestedCookies, message: "Đã xác thực OTP và tự động gán đúng luồng .AspNetCore.Cookies & .fms_radio thành công!" };
   }
 
   throw new Error("Không trích xuất được Cookie .AspNetCore.Cookies từ FMS");
