@@ -54,6 +54,44 @@ let wsAccount = "ytv.lan";
 let hubConnection = null;
 let isSessionValid = false;
 let expiredAlertSent = false;
+
+// ==================== QUY TẮC TỰ ĐỘNG XIN OTP SAU 3 LẦN ĐỐI SOÁT 20K THẤT BẠI ====================
+let consecutiveReconcileFailures = 0;
+const AUTO_OTP_COOLDOWN_MS = 15 * 60 * 1000; // Tối thiểu 15 phút giữa 2 lần tự xin OTP để chống spam SMS
+
+async function handleReconcileFailure(reason = "") {
+  consecutiveReconcileFailures++;
+  console.warn(`⚠️ [QUY TẮC ĐỐI SOÁT] Đối soát 20k thất bại lần ${consecutiveReconcileFailures}/3. Lý do: ${reason}`);
+
+  if (consecutiveReconcileFailures >= 3) {
+    const now = Date.now();
+    if (now - lastAutoOtpRequestTime < AUTO_OTP_COOLDOWN_MS) {
+      console.warn(`⏳ [AUTO OTP] Đã đối soát 20k thất bại ${consecutiveReconcileFailures} lần liên tiếp nhưng đang trong thời gian cooldown (15 phút).`);
+      return;
+    }
+
+    lastAutoOtpRequestTime = now;
+    console.log(`🚨 [AUTO OTP RULE] ĐÃ ĐỐI SOÁT 20K THẤT BẠI 3 LẦN LIÊN TIẾP! TỰ ĐỘNG GỬI YÊU CẦU MÃ OTP CAS VNPT NGAY...`);
+
+    sendTelegramMessage(`🚨 *CẢNH BÁO FMS:* Đối soát 20.000 tin thất bại 3 lần liên tiếp do Cookie hết hạn (${reason}). Cloud Worker đang tự động gửi yêu cầu cấp mã OTP mới về điện thoại...`).catch(() => {});
+
+    const targetUser = currentAccount || (currentSyncMode === "CLOUD_REST" ? "huyhd.lan" : "ytv.lan");
+    const targetPass = (targetUser === "ytv.lan") ? "P#r9zhk4" : (process.env.FMS_CAS_PASS || "Vnpt@123456");
+
+    try {
+      const otpRes = await requestCasOtp(targetUser, targetPass);
+      console.log(`✅ [AUTO OTP] Đã tự động kích hoạt gửi mã OTP cho ${targetUser}:`, otpRes.message);
+      await fetch(`${FIREBASE_DB_URL}/_fms_config/cas_command_result.json`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...otpRes, trigger: "auto_rule_3_failures", timestamp: Date.now() })
+      }).catch(() => {});
+    } catch (errOtp) {
+      console.error(`❌ [AUTO OTP] Lỗi khi tự động gửi yêu cầu OTP:`, errOtp.message);
+    }
+  }
+}
+
 let lastPingTime = null;
 let lastSyncTime = null;
 let activeAlarmCount = 0;
