@@ -786,10 +786,11 @@ async function fetchDualSourceAlarms(activeCookie) {
   const fromDate = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
   const toDate = new Date(now.getTime() + 1 * 24 * 60 * 60 * 1000);
 
+  const provinceParam = (currentAccount === "ytv.lan" || currentSyncMode === "SIGNALR_WEBSOCKET") ? "1006" : FMS_PROVINCE;
   const baseParams = {
     rowslimit: "20000",
     SYSTEM_TYPE: "",
-    PROVINCE: FMS_PROVINCE,
+    PROVINCE: provinceParam,
     DISTRICT: "",
     SUPPLIER_ID: "",
     NE_TYPE: "",
@@ -916,10 +917,14 @@ async function syncFullSnapshotFromRestApi() {
     const result = await fetchDualSourceAlarms(activeCookie);
 
     if (result.isAuthExpired) {
-      console.warn(`⚠️ [SNAPSHOT DUAL] REST API trả về Auth Error -> Cookie HTTP đã hết hạn! Kích hoạt quy trình xin OTP mới...`);
-      isSessionValid = false;
-      await notifyCookieExpired();
-      return;
+      if (currentSyncMode === "CLOUD_REST") {
+        console.warn(`⚠️ [SNAPSHOT DUAL] REST API trả về Auth Error -> Cookie HTTP đã hết hạn! Kích hoạt quy trình xin OTP mới...`);
+        isSessionValid = false;
+        await notifyCookieExpired();
+        return;
+      } else {
+        console.warn(`⚠️ [SNAPSHOT DUAL] Hướng REST API cũ không có cookie hợp lệ, bỏ qua và duy trì SignalR WebSocket.`);
+      }
     }
 
     const alarms = result.combined;
@@ -933,6 +938,11 @@ async function syncFullSnapshotFromRestApi() {
       // 2. Đẩy qua Google Sheets
       await syncFirebaseSnapshotToGoogleSheets(alarms);
       console.log(`[SNAPSHOT DUAL] Đã đẩy thành công ${alarms.length} sự cố hợp nhất qua Firebase đến Google Sheets.`);
+    } else if (activeAlarmsMemoryMap.size > 0) {
+      const memList = Array.from(activeAlarmsMemoryMap.values());
+      console.log(`[SNAPSHOT DUAL] Đồng bộ ${memList.length} sự cố từ bộ nhớ SignalR WebSocket sang Google Sheets & Firebase...`);
+      await pushAlarmsToFirebase(memList, true);
+      await syncFirebaseSnapshotToGoogleSheets(memList);
     } else {
       console.log(`[SNAPSHOT DUAL] Cả 2 hướng REST API trả về 0 bản ghi cho [${currentAccount}]. Tự động đồng bộ Snapshot từ Firebase sang Google Sheets...`);
       await syncFirebaseSnapshotToGoogleSheets();
